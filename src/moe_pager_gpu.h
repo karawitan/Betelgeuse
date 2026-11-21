@@ -9,6 +9,11 @@
 
 #if defined(GGML_USE_HIP) || defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
 
+// plain-C++ TUs (hipcc not driving this file) need the platform selected by hand
+#ifndef __HIP_PLATFORM_AMD__
+#define __HIP_PLATFORM_AMD__
+#endif
+
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 
