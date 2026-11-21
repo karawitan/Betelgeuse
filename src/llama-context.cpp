@@ -2171,13 +2171,19 @@ static void moe_slot_resolve_sync(
     static double s_tres = 0.0, s_ta = 0.0, s_tio = 0.0;
     cudaStream_t st = (cudaStream_t) stream;
     auto t_a = std::chrono::high_resolution_clock::now();
-    cudaStreamSynchronize(st);
+    // during stream capture HIP crashes inside synchronous hipMemcpy while
+    // CUDA only fails the call; skip the copies like CUDA does
+    cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+    const bool capturing = st &&
+        cudaStreamIsCapturing(st, &capture_status) == cudaSuccess &&
+        capture_status != cudaStreamCaptureStatusNone;
+    if (!capturing) cudaStreamSynchronize(st);
     std::vector<int32_t> ids((size_t) total);
     if (topk_nb0 == sizeof(int32_t) && topk_nb1 == (size_t) nk * sizeof(int32_t)) {
-        cudaMemcpy(ids.data(), topk, (size_t) total * sizeof(int32_t), cudaMemcpyDeviceToHost);
+        if (!capturing) cudaMemcpy(ids.data(), topk, (size_t) total * sizeof(int32_t), cudaMemcpyDeviceToHost);
     } else {
         for (int64_t t = 0; t < nt; t++) {
-            cudaMemcpy(ids.data() + (size_t) t * nk,
+            if (!capturing) cudaMemcpy(ids.data() + (size_t) t * nk,
                        (const char *) topk + (size_t) t * topk_nb1,
                        (size_t) nk * sizeof(int32_t), cudaMemcpyDeviceToHost);
         }
@@ -2189,7 +2195,7 @@ static void moe_slot_resolve_sync(
         static int look_pf = -1;
         if (look_pf < 0) { const char * e = getenv("MOE_LOOK_PF"); look_pf = (e && atoi(e) != 0) ? 1 : 0; }
         std::vector<int32_t> pred((size_t) std::min<int64_t>(lnk, 6));
-        cudaMemcpy(pred.data(), look, pred.size() * sizeof(int32_t), cudaMemcpyDeviceToHost);
+        if (!capturing) cudaMemcpy(pred.data(), look, pred.size() * sizeof(int32_t), cudaMemcpyDeviceToHost);
         for (int c = 0; c < 6; c++) {
             ctx->look_pred[(size_t) (il + 1) * 6 + c] = c < (int) pred.size() ? pred[(size_t) c] : -1;
         }

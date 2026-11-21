@@ -683,6 +683,12 @@ bool moe_pager::fetch_direct_io(int il, int e, void * dst_gate, size_t gate_byte
     }
 
     const uint32_t * bsrc = pack_mode_ ? &bsrc_[(size_t) (il * n_expert_ + e) * 3] : nullptr;
+    // during stream capture HIP crashes inside synchronous hipMemcpy while
+    // CUDA only fails the call; skip the copies like CUDA does
+    cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+    const bool capturing = stream &&
+        cudaStreamIsCapturing((cudaStream_t) stream, &cs) == cudaSuccess &&
+        cs != cudaStreamCaptureStatusNone;
     size_t off = 0;
     void * dst[3] = { dst_gate, dst_up, dst_down };
     size_t want[3] = { gate_bytes, up_bytes, down_bytes };
@@ -691,8 +697,10 @@ bool moe_pager::fetch_direct_io(int il, int e, void * dst_gate, size_t gate_byte
         const size_t avail = pack_mode_
             ? role_bytes_[(size_t) il * 3 + (size_t) k]
             : ((size_t) s[k].len - skip);
-        cudaMemcpy(dst[k], src + (pack_mode_ ? 0 : off) + skip,
-                   std::min(want[k], avail), cudaMemcpyHostToDevice);
+        if (!capturing) {
+            cudaMemcpy(dst[k], src + (pack_mode_ ? 0 : off) + skip,
+                       std::min(want[k], avail), cudaMemcpyHostToDevice);
+        }
         if (!pack_mode_) off += s[k].len;
     }
     return true;
