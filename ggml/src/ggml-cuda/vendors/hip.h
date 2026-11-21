@@ -56,6 +56,8 @@
 #define cudaDeviceGetPCIBusId hipDeviceGetPCIBusId
 #define cudaDeviceProp hipDeviceProp_t
 #define cudaDeviceSynchronize hipDeviceSynchronize
+#define cudaDeviceScheduleSpin hipDeviceScheduleSpin
+#define cudaSetDeviceFlags hipSetDeviceFlags
 #define cudaError_t hipError_t
 #define cudaErrorMemoryAllocation hipErrorOutOfMemory
 #define cudaErrorPeerAccessAlreadyEnabled hipErrorPeerAccessAlreadyEnabled
@@ -97,6 +99,7 @@
 #define cudaMemcpyKind hipMemcpyKind
 #define cudaMemset hipMemset
 #define cudaMemsetAsync hipMemsetAsync
+#define cudaMemset2DAsync hipMemset2DAsync
 #define cudaMemGetInfo hipMemGetInfo
 #define cudaOccupancyMaxPotentialBlockSize hipOccupancyMaxPotentialBlockSize
 #define cudaSetDevice hipSetDevice
@@ -153,6 +156,12 @@ static inline hipError_t cudaStreamWaitEvent(hipStream_t stream, hipEvent_t even
 #define cudaOccupancyMaxActiveBlocksPerMultiprocessor hipOccupancyMaxActiveBlocksPerMultiprocessor
 #define cudaFuncSetAttribute hipFuncSetAttribute
 #define cudaFuncAttributeMaxDynamicSharedMemorySize hipFuncAttributeMaxDynamicSharedMemorySize
+#define cudaFuncAttributes hipFuncAttributes
+#define cudaFuncGetAttributes hipFuncGetAttributes
+#define cudaStreamIsCapturing hipStreamIsCapturing
+#define cudaStreamCaptureStatus hipStreamCaptureStatus
+#define cudaStreamCaptureStatusActive hipStreamCaptureStatusActive
+#define cudaStreamCaptureStatusNone hipStreamCaptureStatusNone
 #define __trap() do { abort(); __builtin_unreachable(); } while(0)
 #define CUBLAS_STATUS_SUCCESS HIPBLAS_STATUS_SUCCESS
 #define CUBLAS_STATUS_NOT_INITIALIZED HIPBLAS_STATUS_NOT_INITIALIZED
