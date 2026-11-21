@@ -15,7 +15,7 @@
 #include <algorithm>
 #include <fcntl.h>
 #include <unistd.h>
-#include <cuda_runtime.h>
+#include "moe_pager_gpu.h"
 #include <cerrno>
 
 static const char * MODEL =
