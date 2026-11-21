@@ -2386,9 +2386,9 @@ static void moe_slot_resolve_sync(
                 int slot = target_slots[i];
                 int e = batch_targets[i].expert;
                 if (!ctx->pager.fetch_direct_io(il, e,
-                    (char *) ctx->moe.pool_gate[il]->data + (size_t) slot * g_slot, g_slot,
-                    (char *) ctx->moe.pool_up[il]->data   + (size_t) slot * u_slot, u_slot,
-                    (char *) ctx->moe.pool_down[il]->data + (size_t) slot * d_slot, d_slot,
+                    (char *) ctx->moe.pool_gate[il]->data + (size_t) (slot - base) * g_slot, g_slot,
+                    (char *) ctx->moe.pool_up[il]->data   + (size_t) (slot - base) * u_slot, u_slot,
+                    (char *) ctx->moe.pool_down[il]->data + (size_t) (slot - base) * d_slot, d_slot,
                     nullptr, slot)) {
                     ctx->moe.prefill_miss++;
                     continue;
