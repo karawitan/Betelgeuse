@@ -3545,9 +3545,21 @@ llama_context::llama_context(
                             moe_slot_resolve_register_ctx(this);
                             if (moe_doorbell_on(this)) {
                                 if (moe_doorbell_init(moe.n_layer, moe.n_expert, moe.s_per_layer)) {
-                                    LLAMA_LOG_INFO("%s: Zero-Split Stream-Ordered Doorbell armed (%d layers, n_splits = 1)\n",
-                                                   __func__, moe.n_layer);
-                                    start_doorbell_worker(this);
+                                    size_t stage_stride = 0;
+                                    for (int il = 0; il < moe.n_layer; il++) {
+                                        const int s_pl_now = moe_get_layer_slots(il, moe.n_layer);
+                                        stage_stride = std::max(stage_stride,
+                                            ggml_nbytes(moe.pool_gate[il]) / (s_pl_now + 1)
+                                            + ggml_nbytes(moe.pool_up[il])   / (s_pl_now + 1)
+                                            + ggml_nbytes(moe.pool_down[il]) / (s_pl_now + 1));
+                                    }
+                                    const char * cap_env = getenv("MOE_STAGE_SLOTS");
+                                    const int stage_slots = cap_env && atoi(cap_env) > 0 ? std::min(256, atoi(cap_env)) : 64;
+                                    if (moe_doorbell_stage_init(stage_stride, stage_slots)) {
+                                        LLAMA_LOG_INFO("%s: Zero-Split Stream-Ordered Doorbell armed (%d layers, n_splits = 1)\n",
+                                                       __func__, moe.n_layer);
+                                        start_doorbell_worker(this);
+                                    }
                                 }
                             }
                         }

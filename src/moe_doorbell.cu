@@ -115,6 +115,51 @@ __device__ __forceinline__ void doorbell_spin() {
 // host and cannot deadlock against the launch queue.
 __device__ __forceinline__ void doorbell_copy(char * dst, const char * src, size_t n, int tid, int nthr) {
     size_t i;
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIP_DEVICE_COMPILE__)
+    // gfx9 caches sysmem reads in the device L2 and CPU writes do not snoop it;
+    // glc loads bypass L2 so stale stage bytes cannot be served.
+    if ((((uintptr_t) dst | (uintptr_t) src) & 15u) == 0) {
+        const size_t step = (size_t) nthr * 16;
+        i = (size_t) tid * 16;
+        for (; i + 16 <= n; i += step) {
+            uint4 v;
+            asm volatile("flat_load_dwordx4 %0, %1 glc\n\ts_waitcnt vmcnt(0)"
+                         : "=v"(v) : "v"(src + i) : "memory");
+            *(uint4 *) (dst + i) = v;
+        }
+        for (size_t j = i; j < n; j += (size_t) nthr) {
+            uint32_t w;
+            asm volatile("flat_load_ubyte %0, %1 glc\n\ts_waitcnt vmcnt(0)"
+                         : "=v"(w) : "v"(src + j) : "memory");
+            dst[j] = (char) w;
+        }
+        return;
+    }
+    if ((((uintptr_t) dst | (uintptr_t) src) & 3u) == 0) {
+        const size_t step = (size_t) nthr * 4;
+        i = (size_t) tid * 4;
+        for (; i + 4 <= n; i += step) {
+            uint32_t w;
+            asm volatile("flat_load_dword %0, %1 glc\n\ts_waitcnt vmcnt(0)"
+                         : "=v"(w) : "v"(src + i) : "memory");
+            *(uint32_t *) (dst + i) = w;
+        }
+        for (size_t j = i; j < n; j += (size_t) nthr) {
+            uint32_t w;
+            asm volatile("flat_load_ubyte %0, %1 glc\n\ts_waitcnt vmcnt(0)"
+                         : "=v"(w) : "v"(src + j) : "memory");
+            dst[j] = (char) w;
+        }
+        return;
+    }
+    for (size_t j = (size_t) tid; j < n; j += (size_t) nthr) {
+        uint32_t w;
+        asm volatile("flat_load_ubyte %0, %1 glc\n\ts_waitcnt vmcnt(0)"
+                     : "=v"(w) : "v"(src + j) : "memory");
+        dst[j] = (char) w;
+    }
+    return;
+#endif
     if ((((uintptr_t) dst | (uintptr_t) src) & 15u) == 0) {
         const size_t step = (size_t) nthr * 16;
         i = (size_t) tid * 16;
