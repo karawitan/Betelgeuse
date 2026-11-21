@@ -18,7 +18,7 @@
 #include "moe_pager.h"
 #include "moe-cpu.h"
 #include "moe_predictor.h"
-#include <cuda_runtime.h>
+#include "moe_pager_gpu.h"
 
 #include "ggml.h"
 #include "llama-arch.h"

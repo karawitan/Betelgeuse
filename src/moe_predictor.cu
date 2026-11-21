@@ -1,7 +1,6 @@
 #include "moe_predictor.h"
 
-#include <cuda_runtime.h>
-#include <cuda_fp16.h>
+#include "moe_pager_gpu.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -139,8 +138,10 @@ __global__ void moe_predictor_v2_fused_kernel(
             uint16_t idx = s_idx[j];
             #pragma unroll
             for (int offset = 16; offset > 0; offset >>= 1) {
-                float other_v = __shfl_down_sync(0xffffffff, v, offset);
-                uint16_t other_i = (uint16_t)__shfl_down_sync(0xffffffff, (unsigned)idx, offset);
+                // explicit width=32: on wave64 targets the default warpSize is
+                // 64 and lane+delta would read a non-participating lane
+                float other_v = __shfl_down_sync(0xffffffff, v, offset, 32);
+                uint16_t other_i = (uint16_t)__shfl_down_sync(0xffffffff, (unsigned)idx, offset, 32);
                 if (other_v > v) {
                     v = other_v;
                     idx = other_i;

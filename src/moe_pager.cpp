@@ -10,7 +10,7 @@
 #include "gguf.h"
 
 #include <liburing.h>
-#include <cuda_runtime.h>
+#include "moe_pager_gpu.h"
 
 #include <algorithm>
 #include <fstream>

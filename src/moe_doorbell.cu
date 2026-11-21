@@ -5,8 +5,7 @@
 extern "C" {
     void ggml_cuda_moe_slot_resolve_register(ggml_cuda_moe_slot_resolve_fn_t fn);
 }
-#include <cuda_runtime.h>
-#include <cuda.h>
+#include "moe_pager_gpu.h"
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
 #endif
@@ -69,22 +68,44 @@ static uint64_t * g_lru_epoch = nullptr;
 
 __device__ __forceinline__ uint32_t pci_ld_u32(const volatile uint32_t * addr) {
     uint32_t val;
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIP_DEVICE_COMPILE__)
+    // gfx9: globally-coherent flat load, bypasses device L2 so host writes are
+    // visible while polling the doorbell
+    asm volatile("flat_load_dword %0, %1 glc" : "=v"(val) : "v"(addr) : "memory");
+#else
     asm volatile("ld.sys.relaxed.u32 %0, [%1];" : "=r"(val) : "l"(addr));
+#endif
     return val;
 }
 
 __device__ __forceinline__ uint64_t pci_ld_u64(const volatile uint64_t * addr) {
     uint64_t val;
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIP_DEVICE_COMPILE__)
+    asm volatile("flat_load_dwordx2 %0, %1 glc" : "=v"(val) : "v"(addr) : "memory");
+#else
     asm volatile("ld.sys.relaxed.u64 %0, [%1];" : "=l"(val) : "l"(addr));
+#endif
     return val;
 }
 
 __device__ __forceinline__ void pci_st_u32(volatile uint32_t * addr, uint32_t val) {
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIP_DEVICE_COMPILE__)
+    asm volatile("flat_store_dword %0, %1 glc" :: "v"(addr), "v"(val) : "memory");
+#else
     asm volatile("st.sys.relaxed.u32 [%0], %1;" :: "l"(addr), "r"(val));
+#endif
 }
 
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIP_DEVICE_COMPILE__)
+__device__ __forceinline__ void pci_st_u64(volatile uint64_t * addr, uint64_t val) {
+    asm volatile("flat_store_dwordx2 %0, %1 glc" :: "v"(addr), "v"(val) : "memory");
+}
+#endif
+
 __device__ __forceinline__ void doorbell_spin() {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIP_DEVICE_COMPILE__)
+    __builtin_amdgcn_s_sleep(4); // ~256 cycles, matches the ~250 ns CUDA path
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
     asm volatile("nanosleep.u32 %0;" :: "r"(250));
 #endif
 }
@@ -181,7 +202,11 @@ __global__ void moe_resolve_slots_kernel(
             const int32_t expert = *(const int32_t *) (topk + (size_t) selected_token * topk_nb1 + (size_t) selected_rank * topk_nb0);
             if (expert >= 0 && expert < n_exp) {
                 uint64_t * address = lru_touch + (size_t) layer * n_exp + expert;
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIP_DEVICE_COMPILE__)
+                pci_st_u64(address, epoch);
+#else
                 asm volatile("st.sys.relaxed.u64 [%0], %1;" :: "l"(address), "l"(epoch));
+#endif
             }
         }
         __threadfence_system();
