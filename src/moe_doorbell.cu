@@ -71,7 +71,7 @@ __device__ __forceinline__ uint32_t pci_ld_u32(const volatile uint32_t * addr) {
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIP_DEVICE_COMPILE__)
     // gfx9: globally-coherent flat load, bypasses device L2 so host writes are
     // visible while polling the doorbell
-    asm volatile("flat_load_dword %0, %1 glc" : "=v"(val) : "v"(addr) : "memory");
+    asm volatile("flat_load_dword %0, %1 glc\n\ts_waitcnt vmcnt(0)" : "=v"(val) : "v"(addr) : "memory");
 #else
     asm volatile("ld.sys.relaxed.u32 %0, [%1];" : "=r"(val) : "l"(addr));
 #endif
@@ -81,7 +81,7 @@ __device__ __forceinline__ uint32_t pci_ld_u32(const volatile uint32_t * addr) {
 __device__ __forceinline__ uint64_t pci_ld_u64(const volatile uint64_t * addr) {
     uint64_t val;
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIP_DEVICE_COMPILE__)
-    asm volatile("flat_load_dwordx2 %0, %1 glc" : "=v"(val) : "v"(addr) : "memory");
+    asm volatile("flat_load_dwordx2 %0, %1 glc\n\ts_waitcnt vmcnt(0)" : "=v"(val) : "v"(addr) : "memory");
 #else
     asm volatile("ld.sys.relaxed.u64 %0, [%1];" : "=l"(val) : "l"(addr));
 #endif
@@ -90,7 +90,7 @@ __device__ __forceinline__ uint64_t pci_ld_u64(const volatile uint64_t * addr) {
 
 __device__ __forceinline__ void pci_st_u32(volatile uint32_t * addr, uint32_t val) {
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIP_DEVICE_COMPILE__)
-    asm volatile("flat_store_dword %0, %1 glc" :: "v"(addr), "v"(val) : "memory");
+    asm volatile("flat_store_dword %0, %1 glc\n\ts_waitcnt vmcnt(0)" :: "v"(addr), "v"(val) : "memory");
 #else
     asm volatile("st.sys.relaxed.u32 [%0], %1;" :: "l"(addr), "r"(val));
 #endif
@@ -98,7 +98,7 @@ __device__ __forceinline__ void pci_st_u32(volatile uint32_t * addr, uint32_t va
 
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIP_DEVICE_COMPILE__)
 __device__ __forceinline__ void pci_st_u64(volatile uint64_t * addr, uint64_t val) {
-    asm volatile("flat_store_dwordx2 %0, %1 glc" :: "v"(addr), "v"(val) : "memory");
+    asm volatile("flat_store_dwordx2 %0, %1 glc\n\ts_waitcnt vmcnt(0)" :: "v"(addr), "v"(val) : "memory");
 }
 #endif
 
