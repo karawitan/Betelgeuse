@@ -56,6 +56,14 @@
 
 #define cudaStreamWaitEvent           hipStreamWaitEvent
 
+// warp sync builtins need HIP_ENABLE_WARP_SYNC_BUILTINS; map to the plain
+// builtins like ggml/src/ggml-cuda/vendors/hip.h does
+#define __shfl_down_sync(mask, var, delta, width) __shfl_down(var, delta, width)
+#define __shfl_up_sync(mask, var, delta, width)   __shfl_up(var, delta, width)
+#define __shfl_xor_sync(mask, var, delta, width)  __shfl_xor(var, delta, width)
+#define __shfl_sync(mask, var, lane, width)       __shfl(var, lane, width)
+#define __ballot_sync(mask, var)                  __ballot(var)
+
 #define cudaHostAlloc                 hipHostMalloc
 #define cudaHostAllocDefault          hipHostMallocDefault
 #define cudaHostAllocMapped           hipHostMallocMapped
