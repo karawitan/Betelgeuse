@@ -121,7 +121,11 @@
 #define cudaStreamNonBlocking hipStreamNonBlocking
 #define cudaStreamPerThread hipStreamPerThread
 #define cudaStreamSynchronize hipStreamSynchronize
-#define cudaStreamWaitEvent hipStreamWaitEvent
+// hipStreamWaitEvent requires the flags argument on ROCm, while CUDA gives it a
+// default of 0 - wrap so call sites with either arity compile
+static inline hipError_t cudaStreamWaitEvent(hipStream_t stream, hipEvent_t event, unsigned int flags = 0) {
+    return hipStreamWaitEvent(stream, event, flags);
+}
 #define cudaGraphExec_t hipGraphExec_t
 #define cudaGraphNode_t hipGraphNode_t
 #define cudaKernelNodeParams hipKernelNodeParams
