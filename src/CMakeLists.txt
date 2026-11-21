@@ -99,6 +99,14 @@ if (GGML_HIP)
     if (TARGET hip::host)
         target_link_libraries(llama PRIVATE hip::host)
     endif()
+    # clang --hip-link adds an implicit -lamdhip64 that can resolve to a
+    # system ROCm of a different SONAME (e.g. .so.5 vs .so.6); prefer the
+    # configured ROCm
+    if (DEFINED ROCM_PATH)
+        target_link_directories(llama PRIVATE ${ROCM_PATH}/lib)
+    elseif (EXISTS /opt/rocm/lib)
+        target_link_directories(llama PRIVATE /opt/rocm/lib)
+    endif()
     target_link_libraries(llama PRIVATE uring)
 endif()
 
