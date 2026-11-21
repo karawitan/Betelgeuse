@@ -52,6 +52,7 @@
 #define cudaMemcpyHostToDevice        hipMemcpyHostToDevice
 #define cudaMemcpyDeviceToHost        hipMemcpyDeviceToHost
 #define cudaMemcpyDeviceToDevice      hipMemcpyDeviceToDevice
+#define cudaMemcpy2DAsync             hipMemcpy2DAsync
 
 #define cudaStreamWaitEvent           hipStreamWaitEvent
 
