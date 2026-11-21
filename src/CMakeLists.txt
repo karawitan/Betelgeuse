@@ -84,11 +84,10 @@ endif()
 if (GGML_HIP)
     target_sources(llama PRIVATE moe_predictor.cu moe_doorbell.cu)
     set_source_files_properties(moe_predictor.cu moe_doorbell.cu PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
-    # in the enable_language(HIP) path .cu must be declared HIP sources;
-    # in the hipcc-as-CXX path they compile natively and this is a no-op
-    if (CMAKE_HIP_COMPILER_LOADED)
-        set_source_files_properties(moe_predictor.cu moe_doorbell.cu PROPERTIES LANGUAGE HIP)
-    endif()
+    # enable_language(HIP) runs in ggml/src/ggml-hip, a sibling dir - by
+    # generation time HIP is enabled project-wide, so mark .cu as HIP
+    # unconditionally; CMAKE_HIP_COMPILER_LOADED does not propagate here
+    set_source_files_properties(moe_predictor.cu moe_doorbell.cu PROPERTIES LANGUAGE HIP)
     target_compile_definitions(llama PRIVATE GGML_USE_HIP)
     if (TARGET hip::host)
         target_link_libraries(llama PRIVATE hip::host)
