@@ -689,6 +689,17 @@ bool moe_pager::fetch_direct_io(int il, int e, void * dst_gate, size_t gate_byte
     const bool capturing = stream &&
         cudaStreamIsCapturing((cudaStream_t) stream, &cs) == cudaSuccess &&
         cs != cudaStreamCaptureStatusNone;
+#if defined(GGML_USE_HIP)
+    static int dbg = -1;
+    if (dbg < 0) dbg = getenv("MOE_FDIO_DBG") ? 1 : 0;
+    if (dbg) {
+        hipPointerAttribute_t attr;
+        const hipError_t pe = hipPointerGetAttributes(&attr, dst_gate);
+        fprintf(stderr, "[fdio] il=%d e=%d dst=%p st=%d pa=%d type=%d dev=%d stage=%p stb=%zu slot=%d\n",
+                il, e, dst_gate, (int) st, (int) pe, (int) attr.type, attr.device,
+                (void *) stage_, stage_bytes_, slot_idx);
+    }
+#endif
     size_t off = 0;
     void * dst[3] = { dst_gate, dst_up, dst_down };
     size_t want[3] = { gate_bytes, up_bytes, down_bytes };
