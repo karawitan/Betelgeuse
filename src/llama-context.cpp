@@ -1418,13 +1418,14 @@ static void start_doorbell_worker(llama_context * ctx) {
 
         std::vector<char>    pinned;
         std::vector<int32_t> old_keys, misses, sel;
+        std::vector<char>    seen;
         std::vector<moe_pager::moe_pack_loc> locs;
         std::vector<const char *> cached_sources;
         std::vector<int>     left;
         std::vector<uint32_t> exp_len;
         std::vector<char>    read_fail, done;
         long served = 0, failed = 0;
-        long n_hit = 0, n_sel = 0;
+        long n_hit = 0, n_sel = 0, n_ovf = 0;
         double t_read = 0.0, t_wait = 0.0;
         long n_read = 0;
 
@@ -1555,22 +1556,30 @@ static void start_doorbell_worker(llama_context * ctx) {
                 sel.resize((size_t) n);
                 misses.clear();
                 misses.reserve((size_t) n);
+                seen.assign((size_t) n_exp, 0);
+                const int n_used = ctx->moe.n_used > 0 ? ctx->moe.n_used : 1;
                 for (int j = 0; j < n; ++j) {
                     const int32_t e = pl->sel[j];
                     sel[(size_t) j] = e;
                     if (e < 0 || e >= n_exp) continue;
                     n_sel++;
+                    const char rank1 = (char) std::min(j % n_used + 1, 255);
                     const int cur = ctx->moe.slot_of[(size_t) il * n_exp + e];
                     if (cur >= base && cur < base + s_pl) {
                         pinned[(size_t) cur - (size_t) base] = 1;
                         ctx->moe.lru.hit((size_t) cur);
                         n_hit++;
                     } else {
-                        misses.push_back(e);
+                        // seen[] doubles as best-selection-rank tracker (rank+1)
+                        if (seen[(size_t) e] == 0) misses.push_back(e);
+                        if (seen[(size_t) e] == 0 || rank1 < seen[(size_t) e]) seen[(size_t) e] = rank1;
                     }
                 }
-                std::sort(misses.begin(), misses.end());
-                misses.erase(std::unique(misses.begin(), misses.end()), misses.end());
+                // when slots run out the lowest-rank misses are the ones that
+                // lose their slot, instead of arbitrary expert ids
+                std::stable_sort(misses.begin(), misses.end(), [&](int32_t a, int32_t b) {
+                    return seen[(size_t) a] < seen[(size_t) b];
+                });
                 const DoorbellPrekick * pre_plan = moe_doorbell_prekick_host(il);
                 const bool join_spec = ring_ok && spec_pending >= 0 && spec_layer == il && pre_plan &&
                     pre_plan->generation == spec_generation &&
@@ -1662,6 +1671,7 @@ static void start_doorbell_worker(llama_context * ctx) {
                     }
                     const int local = (cur >= base && cur < base + s_pl) ? cur - base : s_pl;
                     pl->assigned[j] = local;
+                    if (e >= 0 && e < n_exp && local == s_pl) n_ovf++;
                     const int old = (local >= 0 && local < s_pl) ? old_keys[(size_t) local] : -1;
                     pl->evicted[j] = (old >= 0 && old != key) ? old - il * n_exp : -1;
                 }
@@ -2024,9 +2034,9 @@ static void start_doorbell_worker(llama_context * ctx) {
 
                 if ((served % 512) == 0) {
                     log_io();
-                    fprintf(stderr, "[doorbell] served=%ld layer=%d n=%d miss=%zu copy=%d failed=%ld "
+                    fprintf(stderr, "[doorbell] served=%ld layer=%d n=%d miss=%zu copy=%d failed=%ld ovf=%ld "
                             "hit=%.1f%% read=%.2f ms/expert wait=%.2f ms/expert\n",
-                            served, il, n, misses.size(), ncopy, failed,
+                            served, il, n, misses.size(), ncopy, failed, n_ovf,
                             n_sel ? 100.0 * (double) n_hit / (double) n_sel : 0.0,
                             n_read ? t_read / n_read : 0.0,
                             n_read ? t_wait / n_read : 0.0);
@@ -2211,7 +2221,7 @@ static void moe_slot_resolve_sync(
         return;
     }
     (void) full; (void) fnk; (void) fnt; (void) full_nb1;
-    static long s_nres = 0, s_nmiss = 0, s_ntok = 0, s_host = 0;
+    static long s_nres = 0, s_nmiss = 0, s_ntok = 0, s_host = 0, s_ovf = 0;
     static double s_tres = 0.0, s_ta = 0.0, s_tio = 0.0;
     cudaStream_t st = (cudaStream_t) stream;
     auto t_a = std::chrono::high_resolution_clock::now();
@@ -2291,9 +2301,10 @@ static void moe_slot_resolve_sync(
             pinned[(size_t) cur - (size_t) base] = 1;
             ctx->moe.n_hit++;
             if (is_decode) ctx->moe.lru.hit((size_t) cur);
-        } else if (!seen[(size_t) e]) {
-            seen[(size_t) e] = 1;
-            uniq.push_back(e);
+        } else {
+            const char rank1 = (char) std::min((int) (i % nk) + 1, 255);
+            if (!seen[(size_t) e]) uniq.push_back(e);
+            if (!seen[(size_t) e] || rank1 < seen[(size_t) e]) seen[(size_t) e] = rank1;
         }
     }
     if (nt == 1 && nk == ctx->moe.n_used) {
@@ -2320,7 +2331,10 @@ static void moe_slot_resolve_sync(
             }
         }
     }
-    std::sort(uniq.begin(), uniq.end());
+    // order victims by best selection rank so scarce slots go to top picks
+    std::stable_sort(uniq.begin(), uniq.end(), [&](int32_t a, int32_t b) {
+        return seen[(size_t) a] < seen[(size_t) b];
+    });
     ctx->moe.count_freq = (nt == 1);
     if (is_decode && nk == ctx->moe.n_used) {
         if (il == 0) {
@@ -2408,7 +2422,10 @@ static void moe_slot_resolve_sync(
         for (size_t i = 0; i < uniq.size(); ++i) {
             const int32_t e = uniq[i];
             const size_t v = ctx->moe.lru.victim((const char *) pinned.data(), (size_t) base, (size_t) s_pl);
-            if (v == (size_t) -1) continue;
+            if (v == (size_t) -1) {
+                if (++s_ovf % 256 == 1) fprintf(stderr, "[moe_res] ovf=%ld il=%d slots=%d/layer\n", s_ovf, il, s_pl);
+                continue;
+            }
             int slot = (int) v;
             pinned[(size_t) slot - (size_t) base] = 1;
 
@@ -2462,10 +2479,10 @@ static void moe_slot_resolve_sync(
         const long wus = ctx->io_warm_us.load(), wn = ctx->io_warm_n.load();
         const long cus = ctx->io_cold_us.load(), cn = ctx->io_cold_n.load();
         fprintf(stderr,
-                "[moe_res] n=%ld tok=%ld nt=%ld sync_ms=%.1f io_ms=%.1f tot_ms=%.1f miss=%ld host=%ld warm=%ld/%ld warm_ms=%.2f cold_ms=%.2f\n",
-                s_nres, s_ntok, nt, s_ta, s_tio, s_tres, s_nmiss, s_host, d_warm, d_warm + d_pack,
+                "[moe_res] n=%ld tok=%ld nt=%ld sync_ms=%.1f io_ms=%.1f tot_ms=%.1f miss=%ld host=%ld ovf=%ld warm=%ld/%ld warm_ms=%.2f cold_ms=%.2f\n",
+                s_nres, s_ntok, nt, s_ta, s_tio, s_tres, s_nmiss, s_host, s_ovf, d_warm, d_warm + d_pack,
                 wn ? (double) wus / wn / 1000.0 : 0.0, cn ? (double) cus / cn / 1000.0 : 0.0);
-        s_tres = 0.0; s_ta = 0.0; s_tio = 0.0; s_nres = 0; s_ntok = 0; s_nmiss = 0; s_host = 0;
+        s_tres = 0.0; s_ta = 0.0; s_tio = 0.0; s_nres = 0; s_ntok = 0; s_nmiss = 0; s_host = 0; s_ovf = 0;
     }
     if (!uniq.empty()) {
         cudaStream_t ws = (cudaStream_t) moe_pager::worker_stream();
@@ -8297,12 +8314,13 @@ void llama_context::moe_page_batch_sorted(int il, const int32_t * sel, int n) {
     std::vector<char> seen((size_t) n_exp, 0);
     std::vector<int32_t> uniq;
     uniq.reserve((size_t) n > 64 ? 64 : (size_t) n);
+    const int n_used = moe.n_used > 0 ? moe.n_used : 1;
     for (int k = 0; k < n; k++) {
         const int32_t e = sel[k];
         if (e < 0 || e >= n_exp) continue;
-        if (seen[(size_t) e]) continue;
-        seen[(size_t) e] = 1;
-        uniq.push_back(e);
+        const char rank1 = (char) std::min(k % n_used + 1, 255);
+        if (!seen[(size_t) e]) uniq.push_back(e);
+        if (!seen[(size_t) e] || rank1 < seen[(size_t) e]) seen[(size_t) e] = rank1;
     }
     std::vector<char> pinned((size_t) s_pl, 0);
     for (size_t k = 0; k < uniq.size(); k++) {
@@ -8312,7 +8330,10 @@ void llama_context::moe_page_batch_sorted(int il, const int32_t * sel, int n) {
             moe.prefill_resident++;
         }
     }
-    std::sort(uniq.begin(), uniq.end());
+    // order victims by best selection rank so scarce slots go to top picks
+    std::stable_sort(uniq.begin(), uniq.end(), [&](int32_t a, int32_t b) {
+        return seen[(size_t) a] < seen[(size_t) b];
+    });
     std::vector<moe_batch_target> batch_targets;
     std::vector<int> target_slots;
     batch_targets.reserve(uniq.size());
@@ -8326,7 +8347,11 @@ void llama_context::moe_page_batch_sorted(int il, const int32_t * sel, int n) {
         const int32_t e = uniq[k];
         if (moe.slot_of[(size_t) il * n_exp + e] >= 0) continue;
         const size_t v = moe.lru.victim((const char *) pinned.data(), (size_t) base, (size_t) s_pl);
-        if (v == (size_t) -1) continue;
+        if (v == (size_t) -1) {
+            static long s_ovf = 0;
+            if (++s_ovf % 1024 == 1) fprintf(stderr, "[moe_page] ovf=%ld slots=%d/layer\n", s_ovf, s_pl);
+            continue;
+        }
         int slot = (int) v;
         pinned[(size_t) slot - (size_t) base] = 1;
 
