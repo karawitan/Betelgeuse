@@ -424,6 +424,9 @@ static const cmd_params cmd_params_defaults = {
     /* output_format_stderr */ NONE,
 };
 
+static bool g_bench_moe_dio   = false;
+static int  g_bench_moe_slots = 0; // 0 = library default
+
 static void print_usage(int /* argc */, char ** argv) {
     printf("usage: %s [options]\n", argv[0]);
     printf("\n");
@@ -472,6 +475,8 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  --poll <0...100>                                  (default: %s)\n", join(cmd_params_defaults.poll, ",").c_str());
     printf("  -ngl, --n-gpu-layers <n>                          (default: %s)\n", join(cmd_params_defaults.n_gpu_layers, ",").c_str());
     printf("  -ncmoe, --n-cpu-moe <n>                           (default: %s)\n", join(cmd_params_defaults.n_cpu_moe, ",").c_str());
+    printf("  -dio, --moe-direct-io                             (default: disabled)\n");
+    printf("  --moe-slots <n>                                   (default: library default)\n");
     printf("  -sm, --split-mode <none|layer|row|tensor>         (default: %s)\n", join(transform_to_str(cmd_params_defaults.split_mode, split_mode_str), ",").c_str());
     printf("  -mg, --main-gpu <i>                               (default: %s)\n", join(cmd_params_defaults.main_gpu, ",").c_str());
     printf("  -nkvo, --no-kv-offload <0|1>                      (default: %s)\n", join(cmd_params_defaults.no_kv_offload, ",").c_str());
@@ -539,6 +544,9 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     params.progress             = cmd_params_defaults.progress;
     params.no_warmup            = cmd_params_defaults.no_warmup;
     params.offline              = cmd_params_defaults.offline;
+
+    g_bench_moe_dio   = false;
+    g_bench_moe_slots = 0;
 
     if (const char * env = getenv("HF_TOKEN")) {
         params.hf_token = env;
@@ -735,6 +743,14 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 }
                 auto p = parse_int_range(argv[i]);
                 params.n_cpu_moe.insert(params.n_cpu_moe.end(), p.begin(), p.end());
+            } else if (arg == "-dio" || arg == "--moe-direct-io") {
+                g_bench_moe_dio = true;
+            } else if (arg == "--moe-slots") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                g_bench_moe_slots = std::stoi(argv[i]);
             } else if (llama_supports_rpc() && (arg == "-rpc" || arg == "--rpc")) {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1254,15 +1270,7 @@ struct cmd_params_instance {
         mparams.no_host       = no_host;
         mparams.use_extra_bufts = repack;
 
-        if (n_cpu_moe <= 0) {
-            if (tensor_buft_overrides.empty()) {
-                mparams.tensor_buft_overrides = nullptr;
-            } else {
-                GGML_ASSERT(tensor_buft_overrides.back().pattern == nullptr &&
-                            "Tensor buffer overrides not terminated with empty pattern");
-                mparams.tensor_buft_overrides = tensor_buft_overrides.data();
-            }
-        } else {
+        {
             static std::vector<llama_model_tensor_buft_override> merged;
             static std::vector<std::string> patterns;
 
@@ -1276,8 +1284,12 @@ struct cmd_params_instance {
             }
             merged.insert(merged.end(), first, last);
 
+            if (g_bench_moe_dio) {
+                merged.push_back(llm_ffn_exps_cpu_override());
+            }
+
             patterns.reserve((size_t) n_cpu_moe);
-            merged.reserve(merged.size() + (size_t) n_cpu_moe + 1);
+            merged.reserve(merged.size() + (size_t) n_cpu_moe + 2);
 
             for (int i = 0; i < n_cpu_moe; ++i) {
                 patterns.push_back(llm_ffn_block_regex(i, LLM_FFN_EXPS_REGEX));
@@ -1285,9 +1297,19 @@ struct cmd_params_instance {
                                 ggml_backend_cpu_buffer_type() });
             }
 
-            merged.push_back({ nullptr, nullptr });
+            if (merged.empty()) {
+                mparams.tensor_buft_overrides = nullptr;
+            } else {
+                merged.push_back({ nullptr, nullptr });
+                mparams.tensor_buft_overrides = merged.data();
+            }
+        }
 
-            mparams.tensor_buft_overrides = merged.data();
+        if (g_bench_moe_dio) {
+            mparams.moe_direct_io = true;
+            if (g_bench_moe_slots > 0) {
+                mparams.moe_slots = g_bench_moe_slots;
+            }
         }
 
         return mparams;
@@ -1315,6 +1337,14 @@ struct cmd_params_instance {
         cparams.embeddings      = embeddings;
         cparams.op_offload      = !no_op_offload;
         cparams.swa_full        = false;
+
+        if (g_bench_moe_dio) {
+            cparams.moe_direct_io = true;
+            if (g_bench_moe_slots > 0) {
+                cparams.moe_slots = g_bench_moe_slots;
+            }
+            cparams.moe_gguf_path = model.c_str();
+        }
 
         return cparams;
     }

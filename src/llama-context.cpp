@@ -142,6 +142,12 @@ static bool moe_doorbell_on(const llama_context * ctx) {
     return on && ctx && ctx->moe_enabled();
 }
 
+static bool moe_db_dump_on() {
+    static int on = -1;
+    if (on < 0) on = getenv("MOE_DB_DUMP") ? 1 : 0;
+    return on != 0;
+}
+
 static llama_context * g_moe_resolve_ctx = nullptr;
 
 static constexpr int MOE_RING_SLOTS = 18;
@@ -1516,6 +1522,7 @@ static void start_doorbell_worker(llama_context * ctx) {
 
                 DoorbellPlan * pl = (DoorbellPlan *) moe_doorbell_plan_host(il);
                 if (!pl) continue;
+                if (moe_db_dump_on()) fprintf(stderr, "[dbw] plan il=%d n=%u\n", il, pl->n);
 
                 const int s_pl = moe_get_layer_slots(il, n_layer);
                 const int base = moe_get_layer_base_slot(il, n_layer);
@@ -1670,6 +1677,13 @@ static void start_doorbell_worker(llama_context * ctx) {
 
                 // publish the plan and ring the doorbell
                 std::atomic_thread_fence(std::memory_order_seq_cst);
+                if (moe_db_dump_on()) fprintf(stderr, "[dbw] publish il=%d ncopy=%d\n", il, ncopy);
+                if (moe_db_dump_on() && il == 0 && n == n_used) {
+                    for (int j = 0; j < n; ++j) fprintf(stderr, "[dbdump] sel[%d]=%d assigned=%d evicted=%d\n",
+                            j, sel[(size_t) j], pl->assigned[j], pl->evicted[j]);
+                    for (int ci = 0; ci < ncopy; ++ci) fprintf(stderr, "[dbdump] miss[%d]=%d copy_slot=%d\n",
+                            ci, misses[(size_t) ci], pl->copy_slot[ci]);
+                }
                 moe_doorbell_signal_unblock(il, nullptr);
 
                 left.assign((size_t) ncopy, 0);
@@ -1970,13 +1984,40 @@ static void start_doorbell_worker(llama_context * ctx) {
                 }
 
                 // The kernel copies from the stage buffer. Wait until it is done
-                // before the next layer reuses those slots.
+                // before the next layer reuses those slots. Bounded: a kernel that
+                // never clears state must not deadlock the worker.
+                const auto wait_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
                 while (dbs[il].state != 0) {
 #if defined(__x86_64__) || defined(_M_X64)
                     _mm_pause();
 #else
                     std::this_thread::yield();
 #endif
+                    if (std::chrono::steady_clock::now() > wait_deadline) {
+                        static long stale = 0;
+                        if ((++stale % 512) == 1) {
+                            fprintf(stderr, "[doorbell] layer %d state stuck at %u, abandoning wait\n",
+                                    il, (unsigned) dbs[il].state);
+                        }
+                        break;
+                    }
+                }
+                if (getenv("MOE_DB_VERIFY") && ncopy > 0) {
+                    static int verified = 0;
+                    if (verified < 3) {
+                        verified++;
+                        const int ci = 0;
+                        const int cslot = pl->copy_slot[ci];
+                        const uint32_t cpre = pl->copy_pre[ci];
+                        std::vector<char> back(gb);
+                        cudaError_t e1 = cudaMemcpy(back.data(),
+                            (const char *) pl->dst_gate + (size_t) cslot * gb, gb,
+                            cudaMemcpyDeviceToHost);
+                        const int cmp = e1 == cudaSuccess ?
+                            memcmp(back.data(), stage_host + (size_t) ci * stride + cpre, gb) : -99;
+                        fprintf(stderr, "[dbverify] il=%d ci=%d expert=%d cslot=%d memcpy_err=%d memcmp=%d\n",
+                                il, ci, misses[(size_t) ci], cslot, (int) e1, cmp);
+                    }
                 }
                 t_wait += std::chrono::duration<double, std::milli>(
                         std::chrono::high_resolution_clock::now() - t_read1).count();
@@ -2118,7 +2159,8 @@ static void moe_slot_resolve_sync(
     size_t scores_nb1,
     const float * input,
     size_t input_nb1,
-    bool hot_only);
+    bool hot_only,
+    int64_t out_ne2);
 
 static void moe_slot_resolve_register_ctx(llama_context * ctx) {
     g_moe_resolve_ctx = ctx;
@@ -2151,7 +2193,9 @@ static void moe_slot_resolve_sync(
     size_t scores_nb1,
     const float * input,
     size_t input_nb1,
-    bool hot_only) {
+    bool hot_only,
+    int64_t out_ne2) {
+    (void) out_ne2;
     (void) op;
     (void) table;
     (void) table_nb0;
@@ -2439,6 +2483,9 @@ static void moe_slot_resolve_sync(
         if (cur >= base && cur < base + s_pl) slot_of[(size_t) i] = cur - base;
     }
     cudaMemcpyAsync(out, slot_of.data(), (size_t) total * sizeof(int32_t), cudaMemcpyHostToDevice, st);
+    if (out_ne2 >= 2) {
+        cudaMemcpyAsync((char *) out + (size_t) nt * out_nb1, ids.data(), (size_t) total * sizeof(int32_t), cudaMemcpyHostToDevice, st);
+    }
 
 }
 
@@ -3525,6 +3572,15 @@ llama_context::llama_context(
                                 const int s_pl_il = moe_get_layer_slots(il, n_layer);
                                 std::vector<int32_t> tab((size_t) n_exp, s_pl_il);
                                 ggml_backend_tensor_set(moe.slot_table[il], tab.data(), 0, n_exp*sizeof(int32_t));
+                            }
+                            moe.host_gate.assign((size_t) n_layer, 0);
+                            moe.host_up.assign((size_t) n_layer, 0);
+                            moe.host_down.assign((size_t) n_layer, 0);
+                            for (int il = 0; il < n_layer; il++) {
+                                const int s_pl_now = moe_get_layer_slots(il, n_layer);
+                                moe.host_gate[il] = ggml_nbytes(moe.pool_gate[il]) / (size_t) (s_pl_now + 1);
+                                moe.host_up[il]   = ggml_nbytes(moe.pool_up[il])   / (size_t) (s_pl_now + 1);
+                                moe.host_down[il] = ggml_nbytes(moe.pool_down[il]) / (size_t) (s_pl_now + 1);
                             }
                             if (moe.sentinel_slot) {
                                 for (int il = 0; il < moe.n_layer; il++) {
@@ -8292,9 +8348,9 @@ void llama_context::moe_page_batch_sorted(int il, const int32_t * sel, int n) {
             int slot = target_slots[i];
             int e = batch_targets[i].expert;
             if (!this->pager.fetch_direct_io(il, e,
-                (char *) moe.pool_gate[il]->data + (size_t) slot * g_slot, g_slot,
-                (char *) moe.pool_up[il]->data   + (size_t) slot * u_slot, u_slot,
-                (char *) moe.pool_down[il]->data + (size_t) slot * d_slot, d_slot,
+                (char *) moe.pool_gate[il]->data + (size_t) (slot - base) * g_slot, g_slot,
+                (char *) moe.pool_up[il]->data   + (size_t) (slot - base) * u_slot, u_slot,
+                (char *) moe.pool_down[il]->data + (size_t) (slot - base) * d_slot, d_slot,
                 nullptr, slot)) {
                 moe.prefill_miss++;
                 continue;

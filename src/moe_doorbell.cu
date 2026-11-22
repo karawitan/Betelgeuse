@@ -18,6 +18,10 @@ extern "C" {
 // Keep this layout in sync with the copy in llama-context.cpp.
 #define MOE_DOORBELL_PLAN_MAX 256
 
+// every host-poll is ~1 us (pci_ld + sleep); a stuck plan must degrade to
+// sentinel rather than spin forever and wedge the GPU behind a hung kernel
+#define MOE_DB_SPIN_LIMIT 2000000u
+
 struct DoorbellPlan {
     volatile uint32_t state;
     volatile uint32_t gpu_ready;
@@ -107,6 +111,18 @@ __device__ __forceinline__ void doorbell_spin() {
     __builtin_amdgcn_s_sleep(4); // ~256 cycles, matches the ~250 ns CUDA path
 #elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
     asm volatile("nanosleep.u32 %0;" :: "r"(250));
+#endif
+}
+
+// exponential-ish backoff: stay fast for the first ~1 ms of polls (the normal
+// case), then drop to ~1/16 rate so a stuck plan does not hammer the host link
+__device__ __forceinline__ void doorbell_backoff(uint32_t it) {
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIP_DEVICE_COMPILE__)
+    if (it < 1024) __builtin_amdgcn_s_sleep(4);
+    else           __builtin_amdgcn_s_sleep(64);
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+    if (it < 1024) asm volatile("nanosleep.u32 %0;" :: "r"(250));
+    else           asm volatile("nanosleep.u32 %0;" :: "r"(4000));
 #endif
 }
 
@@ -206,7 +222,8 @@ __global__ void moe_resolve_slots_kernel(
     uint32_t * dma_done,
     bool use_dma,
     uint64_t * lru_touch,
-    uint64_t * lru_epoch
+    uint64_t * lru_epoch,
+    int64_t    out_slices
 ) {
     const int tid = (int) (blockIdx.x * blockDim.x + threadIdx.x);
     LayerDoorbell & db = doorbells[layer];
@@ -218,8 +235,11 @@ __global__ void moe_resolve_slots_kernel(
     __shared__ uint32_t s_cpre;
     __shared__ uint32_t s_ncopy, s_stride, s_gb, s_ub, s_db, s_spl;
     __shared__ uint64_t s_stage, s_dgate, s_dup, s_ddown;
+    __shared__ int s_nfail;
+    __shared__ int32_t s_failed[MOE_DOORBELL_PLAN_MAX];
     if (tid == 0) {
         s_miss = 0;
+        s_nfail = 0;
     }
     __syncthreads();
 
@@ -290,6 +310,9 @@ __global__ void moe_resolve_slots_kernel(
             const int k = tid % nk;
             const int t = tid / nk;
             *(int32_t *) (out + (size_t) t * out_nb1 + (size_t) k * out_nb0) = slot;
+            if (out_slices >= 2) {
+                *(int32_t *) (out + (size_t) (nt + t) * out_nb1 + (size_t) k * out_nb0) = exp;
+            }
         }
         return;
     }
@@ -317,18 +340,48 @@ __global__ void moe_resolve_slots_kernel(
             const int selected = tid % nk;
             const int token = tid / nk;
             *(int32_t *) (out + (size_t) token * out_nb1 + (size_t) selected * out_nb0) = slot;
+            if (out_slices >= 2) {
+                *(int32_t *) (out + (size_t) (nt + token) * out_nb1 + (size_t) selected * out_nb0) = exp;
+            }
         }
         return;
     }
 
-    // Every thread spins so the block stays together. The host stages the
-    // missing expert bytes in pinned memory and sets gpu_ready. Each expert is
-    // copied as soon as its read lands, so the copy overlaps the remaining I/O.
-    while (pci_ld_u32(&db.gpu_ready) == 0) {
-        doorbell_spin();
+
+
+    // The host stages the missing expert bytes in pinned memory and sets
+    // gpu_ready. Each expert is copied as soon as its read lands, so the copy
+    // overlaps the remaining I/O. Polls are bounded: a stuck plan degrades to
+    // sentinel instead of hanging the kernel.
+    if (tid == 0) {
+        uint32_t it = 0;
+        while (pci_ld_u32(&db.gpu_ready) == 0 && ++it < MOE_DB_SPIN_LIMIT) {
+            doorbell_backoff(it);
+        }
+        s_ready = pci_ld_u32(&db.gpu_ready) == 0 ? -1 : 1;
     }
-    __threadfence_system();
     __syncthreads();
+    __threadfence_system();
+    if (s_ready < 0) {
+        // the worker never armed the plan; hit slots still resolve, misses
+        // fall back to sentinel instead of hanging the launch
+        if (tid < total) {
+            const int32_t res = (slot >= 0 && slot < sentinel) ? slot : sentinel;
+            const int k = tid % nk;
+            const int t = tid / nk;
+            *(int32_t *) (out + (size_t) t * out_nb1 + (size_t) k * out_nb0) = res;
+            if (out_slices >= 2) {
+                *(int32_t *) (out + (size_t) (nt + t) * out_nb1 + (size_t) k * out_nb0) = exp;
+            }
+        }
+        __syncthreads();
+        if (tid == 0) {
+            pci_st_u32(&db.gpu_ready, 0);
+            pci_st_u32(&db.state, 0);
+            __threadfence_system();
+        }
+        return;
+    }
 
     if (tid == 0) {
         s_ncopy  = pci_ld_u32(&pl.n_copy);
@@ -341,6 +394,10 @@ __global__ void moe_resolve_slots_kernel(
         s_dgate  = pci_ld_u64(&pl.dst_gate);
         s_dup    = pci_ld_u64(&pl.dst_up);
         s_ddown  = pci_ld_u64(&pl.dst_down);
+        if (s_ncopy > MOE_DOORBELL_PLAN_MAX || s_stage < 0x10000 || s_dgate < 0x10000 ||
+            s_stride == 0 || s_gb == 0 || s_ub == 0 || s_db == 0) {
+            s_ncopy = 0;
+        }
     }
     __syncthreads();
 
@@ -348,20 +405,36 @@ __global__ void moe_resolve_slots_kernel(
     for (uint32_t ci = 0; ci < s_ncopy; ++ci) {
         if (tid == 0) {
             uint32_t r;
+            uint32_t it = 0;
             do {
                 r = pci_ld_u32(&pl.copy_ready[ci]);
-            } while (r == 0);
+                if (r == 0) doorbell_backoff(it);
+            } while (r == 0 && ++it < MOE_DB_SPIN_LIMIT);
             s_ready = (int) r;
             if (r == 1) {
                 s_cslot = (int32_t) pci_ld_u32((const volatile uint32_t *) &pl.copy_slot[ci]);
                 s_cpre  = pci_ld_u32(&pl.copy_pre[ci]);
+            } else if (s_nfail < MOE_DOORBELL_PLAN_MAX) {
+                s_failed[s_nfail++] = (int32_t) pci_ld_u32(
+                    (const volatile uint32_t *) &pl.copy_slot[ci]);
             }
         }
         __syncthreads();
         const int32_t cslot = s_cslot;
-        if (s_ready == 1 && cslot >= 0 && (uint32_t) cslot < s_spl) {
+        if (s_ready == 1 && cslot >= 0 && (uint32_t) cslot < s_spl && s_cpre <= s_stride) {
             if (use_dma) {
-                while (pci_ld_u32(&dma_done[layer * MOE_DOORBELL_PLAN_MAX + ci]) == 0) doorbell_spin();
+                if (tid == 0) {
+                    uint32_t it = 0;
+                    while (pci_ld_u32(&dma_done[layer * MOE_DOORBELL_PLAN_MAX + ci]) == 0
+                           && ++it < MOE_DB_SPIN_LIMIT) {
+                        doorbell_backoff(it);
+                    }
+                    if (pci_ld_u32(&dma_done[layer * MOE_DOORBELL_PLAN_MAX + ci]) == 0 &&
+                        s_nfail < MOE_DOORBELL_PLAN_MAX) {
+                        s_failed[s_nfail++] = cslot;
+                    }
+                }
+                __syncthreads();
                 __threadfence_system();
             } else {
                 const char * src = (const char *) (uintptr_t) s_stage + (size_t) ci * s_stride + s_cpre;
@@ -382,13 +455,22 @@ __global__ void moe_resolve_slots_kernel(
         if (old_exp >= 0 && old_exp < n_exp && old_exp != exp) {
             slot_map[old_exp] = sentinel;
         }
-        const int32_t res = (new_slot >= 0 && new_slot < sentinel) ? new_slot : sentinel;
+        int32_t res = (new_slot >= 0 && new_slot < sentinel) ? new_slot : sentinel;
+        for (int f = 0; f < s_nfail; ++f) {
+            if (s_failed[f] == res) {
+                res = sentinel;
+                break;
+            }
+        }
         if (exp >= 0 && exp < n_exp) {
             slot_map[exp] = res;
         }
         const int k = tid % nk;
         const int t = tid / nk;
         *(int32_t *) (out + (size_t) t * out_nb1 + (size_t) k * out_nb0) = res;
+        if (out_slices >= 2) {
+            *(int32_t *) (out + (size_t) (nt + t) * out_nb1 + (size_t) k * out_nb0) = exp;
+        }
     }
     __syncthreads();
 
@@ -428,7 +510,8 @@ static __global__ void moe_prefill_resolve_kernel(
     const int32_t * __restrict__ slot_map,
     int total,
     int n_exp,
-    int sentinel
+    int sentinel,
+    int64_t out_ne2
 ) {
     const int tid = (int) (threadIdx.x + blockDim.x * blockIdx.x);
     if (tid >= total) return;
@@ -438,6 +521,9 @@ static __global__ void moe_prefill_resolve_kernel(
         slot = slot_map[exp_id];
     }
     out[tid] = (slot >= 0 && slot < sentinel) ? slot : sentinel;
+    if (out_ne2 > 1) {
+        out[total + tid] = exp_id;
+    }
 }
 
 extern "C" void * moe_doorbell_plan_host(int il) {
@@ -480,7 +566,8 @@ void moe_doorbell_resolve_launch(
     size_t scores_nb1,
     const float * input,
     size_t input_nb1,
-    bool hot_only
+    bool hot_only,
+    int64_t out_ne2
 ) {
     (void) table_nb0;
     (void) full; (void) fnk; (void) fnt; (void) full_nb1; (void) look; (void) lnk;
@@ -507,7 +594,7 @@ void moe_doorbell_resolve_launch(
         const int block = 256;
         const int grid = (total + block - 1) / block;
         moe_prefill_resolve_kernel<<<grid, block, 0, s>>>(
-            topk, out, table, total, n_exp, sentinel
+            topk, out, table, total, n_exp, sentinel, out_ne2
         );
         return;
     }
@@ -517,14 +604,15 @@ void moe_doorbell_resolve_launch(
             il, (const char *) topk, (char *) out, const_cast<int32_t *>(table),
             g_doorbells_dev, g_plans_dev, g_prekick_dev,
             (int) nk, (int) nt, topk_nb0, topk_nb1, out_nb0, out_nb1,
-            n_exp, sentinel, total, op, g_count_enabled, g_dma_done, use_dma, g_lru_dev, g_lru_epoch
+            n_exp, sentinel, total, op, g_count_enabled, g_dma_done, use_dma, g_lru_dev, g_lru_epoch,
+            out_ne2
         );
     } else {
         const int total = (int) total64;
         const int block = 256;
         const int grid = (total + block - 1) / block;
         moe_prefill_resolve_kernel<<<grid, block, 0, s>>>(
-            topk, out, table, total, n_exp, sentinel
+            topk, out, table, total, n_exp, sentinel, out_ne2
         );
     }
 }
@@ -658,7 +746,11 @@ bool moe_doorbell_dma_store(int il, int slot, char * destination) {
 
 bool moe_doorbell_init(int n_layer, int n_expert, int s_per_layer) {
     (void) s_per_layer;
-    if (g_active) return true;
+    if (g_active) {
+        // a later context may have re-registered the sync fallback; restore ours
+        ggml_cuda_moe_slot_resolve_register(moe_doorbell_resolve_launch);
+        return true;
+    }
     if (n_layer <= 0 || n_expert <= 0 || (size_t) n_layer > SIZE_MAX / sizeof(uint64_t) / (size_t) n_expert) return false;
     g_n_layer = n_layer;
     g_n_expert = n_expert;

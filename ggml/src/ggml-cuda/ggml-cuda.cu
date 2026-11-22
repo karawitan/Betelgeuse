@@ -2730,7 +2730,7 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                     ggml_get_op_params_i32(dst, 1), dst->op,
                     scores_data, scores_nb1,
                     input_data, input_nb1,
-                    hot_only);
+                    hot_only, (int64_t) dst->ne[2]);
             } break;
         case GGML_OP_RWKV_WKV7:
             ggml_cuda_op_rwkv_wkv7(ctx, dst);

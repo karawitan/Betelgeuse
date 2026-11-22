@@ -66,7 +66,8 @@ typedef void (*ggml_cuda_moe_slot_resolve_fn_t)(
     size_t scores_nb1,
     const float * input,
     size_t input_nb1,
-    bool hot_only);
+    bool hot_only,
+    int64_t out_ne2);
 
 GGML_BACKEND_API void ggml_cuda_moe_slot_resolve_register(ggml_cuda_moe_slot_resolve_fn_t fn);
 
