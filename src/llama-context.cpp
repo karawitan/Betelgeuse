@@ -1326,7 +1326,7 @@ static void moe_ffn_down_sync(void * stream, const ggml_tensor * kick, ggml_tens
 
 // Per-layer batch plan published by the resolve kernel. Keep in sync with
 // src/moe_doorbell.cu.
-#define MOE_DOORBELL_PLAN_MAX 256
+#define MOE_DOORBELL_PLAN_MAX 512
 struct DoorbellPlan {
     volatile uint32_t state;
     volatile uint32_t gpu_ready;

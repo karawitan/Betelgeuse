@@ -16,7 +16,7 @@ extern "C" {
 // Per-layer batch plan. It is host-mapped so the kernel can publish the full
 // top-k list and the host pager can answer without a graph split.
 // Keep this layout in sync with the copy in llama-context.cpp.
-#define MOE_DOORBELL_PLAN_MAX 256
+#define MOE_DOORBELL_PLAN_MAX 512
 
 // every host-poll is ~1 us (pci_ld + sleep); a stuck plan must degrade to
 // sentinel rather than spin forever and wedge the GPU behind a hung kernel
